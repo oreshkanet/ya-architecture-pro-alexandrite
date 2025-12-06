@@ -1,0 +1,74 @@
+@startuml
+actor "MES UI (React)" as mes_ui
+participant "MES API (C#)" as mes_api
+database "Redis Cache" as redis
+database "MES-DB (PostgreSQL)" as mes_db
+participant "RabbitMQ" as rabbit
+participant "CRM API (SpringBoot)" as crm_api
+
+== 1. Чтение списка заказов (GET /orders?status=MANUFACTURING_STARTED) ==
+mes_ui -> mes_api: GET /orders?status=MANUFACTURING_STARTED
+activate mes_api
+
+mes_api -> redis: GET "orders:list:status=MANUFACTURING_STARTED"
+activate redis
+redis --> mes_api: {orders: [...]} (HIT) \nили null (MISS)
+deactivate redis
+
+alt Cache HIT
+    mes_api --> mes_ui: 200 OK + data (из кеша)\n Latency: ~20-50 ms
+else Cache MISS
+    mes_api -> mes_db: SELECT * FROM orders WHERE status = 'MANUFACTURING_STARTED' LIMIT 50
+    activate mes_db
+    mes_db --> mes_api: rows
+    deactivate mes_db
+
+    mes_api -> redis: SET "orders:list:status=MANUFACTURING_STARTED" \nEX 30 (TTL=30s)
+    activate redis
+    redis --> mes_api: OK
+    deactivate redis
+
+    mes_api --> mes_ui: 200 OK + data\n Latency: ~800-2000 ms
+end
+
+deactivate mes_api
+
+note right of mes_api
+  Ключ кеша включает параметры фильтрации:
+  - status
+  - page/limit (если пагинация)
+  - sort
+  TTL = 30 сек — баланс между свежестью и нагрузкой
+end note
+
+== 2. Изменение статуса заказа в CRM (MANUFACTURING_APPROVED) ==
+"CRM UI (Vue)" -> crm_api: PATCH /orders/ORD-123 {status: "MANUFACTURING_APPROVED"}
+activate crm_api
+
+crm_api -> mes_db: UPDATE orders SET status = ..., updated_at = NOW() WHERE id = 'ORD-123'
+activate mes_db
+mes_db --> crm_api: OK
+deactivate mes_db
+
+crm_api -> rabbit: Publish OrderStatusChanged {\n  orderId: "ORD-123",\n  oldStatus: "PRICE_CALCULATED",\n  newStatus: "MANUFACTURING_APPROVED"\n}
+activate rabbit
+rabbit --> mes_api: Consume event
+deactivate rabbit
+
+mes_api -> redis: DEL "order:ORD-123",\n "orders:list:*" (pattern delete via Lua script или отдельные ключи)
+activate redis
+redis --> mes_api: OK
+deactivate redis
+
+crm_api --> "CRM UI (Vue)": 200 OK
+deactivate crm_api
+
+note right of mes_api
+  Инвалидация:
+  - Удаляются все кеш-ключи, связанные с заказом:
+    - order:ORD-123 (детали)
+    - orders:list:* (все списки, где он мог быть)
+  - Не используется Write-Through — инвалидация проще и надёжнее
+end note
+
+@enduml
